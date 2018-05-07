@@ -1,0 +1,235 @@
+---
+title: "Titanic Play-around"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r Setup}
+knitr::opts_chunk$set(warning = FALSE, echo = TRUE, message = FALSE)
+```
+
+## Overview
+
+In this I just played around with a couple of the titanic variables to see if I could create some extra features for classification.  How close a cabin was to the exits may have given some passengers advantages when getting to the lifeboats.  And the class of ticket may have had some effect in differienting who was let onto the lifeboats, with higher class ticket holders getting preference.  The problem with both is that they are not easy to quantitative.  Tickets appeared to be random numbers with occasional prefixes.  The cabins were a bit more orderly, with deck and cabin number, but without having a layout of the ship, it isn't possible to work out their proximity to exits.  So instead I propose to let a random forest try and work out which cabins were more likely to survive.  This was created as a feature.  Also a CabinRecorded feature was added, as the majority of passengers didn't have their cabin recorded.  This could have been random, or could have meaning.
+
+After I created a model based on the feature enhancements from the popular Titanic R tutorial as well as my extra features.  I used caret and caretEnsemble to create an ensemble/stacked model using quite different sub-models (elastic nets, random-forests, svm, knn, etc.).  One flaw with this submission is that I am using models that predict continous values, rather than categories.  However it ranks in the top 5-10% of submissions.
+
+```{r Libraries}
+library(tidyverse)
+library(caretEnsemble)
+library(caret)
+library(doParallel)
+library(e1071)
+library(RANN)
+library(randomForest)
+```
+
+```{r Functions, echo=FALSE}
+# These are some useful functions I have written for my own library
+
+# Get Best Tune
+GetBestTune <- function(Model) {
+  if (any(class(Model)=="caretStack"))
+    Model$ens_model$results[rownames(Model$ens_model$bestTune), ]
+  else
+    Model$results[rownames(Model$bestTune), ]
+}
+
+# Get Out Of Sample Predictions
+GetOutOfSamplePredictions <- function(Model) {
+  if (any(class(Model) == "caretStack")) {
+    if (any(class(Model$ens_model$finalModel) == "glmnet")) {
+      Coefs <- coef(Model$ens_model$finalModel, s=Model$ens_model$finalModel$tuneValue$lambda)[, 1]
+    } else {
+      Coefs <- coef(Model$ens_model$finalModel)
+      names(Coefs) <- c("(intercept)", names(Model$models))
+    }
+    PredictionsMatrix <- matrix(rep(1, times=nrow(Model$ens_model$trainingData), ncol=1))
+    for (Name in names(Model$models))
+      PredictionsMatrix <- cbind(PredictionsMatrix, GetOutOfSamplePredictions(Model$models[[Name]]))
+    return(PredictionsMatrix %*% (Coefs))
+  }
+  else {
+    BestTune <- GetBestTune(Model)
+    Parameters <- names(BestTune)[!(names(BestTune) %in% c(Model$perfNames, paste0(Model$perfNames, "SD")))]
+    BestTunePredictions <- Model$pred[eval(parse(text=paste(paste0("Model$pred$", Parameters, " == BestTune$", Parameters), collapse=" & "))), ]
+    Predictions <- data.frame()
+    for (Fold in gsub("Resample", "Fold", names(Model$control$indexOut)))
+      Predictions <- rbind(Predictions, unique(BestTunePredictions[BestTunePredictions$Resample==Fold, ]))
+    as.numeric(Predictions$pred[order(Predictions$rowIndex)])
+  }
+}
+
+# Create Cluster
+CreateCluster <- function(NoOfClusters=0) {
+  # Setup Parallel Clusters
+  require(doParallel, quietly = T)
+
+  tryCatch({ stopCluster(Cluster) }, warning = function(w) {}, error = function(e) {}, finally = {})
+  # Setup Parallel Clusters
+  NoOfCores <- detectCores()
+  if (NoOfClusters == 0) {
+    NoOfClusters <- pmax(round(NoOfCores/2), NoOfCores-5)
+  }
+
+  NoOfCores <- detectCores()
+  if (NoOfClusters == 0) {
+    NoOfClusters <- pmax(round(NoOfCores/2), NoOfCores-5)
+  }
+
+  Cluster <- makePSOCKcluster(NoOfClusters, outfile="")
+  clusterEvalQ(Cluster, library(foreach))
+  
+  registerDoParallel(Cluster)
+  
+  NoOfClusters <<- NoOfClusters
+  Cluster <<- Cluster
+}
+```
+
+```{r LoadData}
+Train <- read.csv("Data/train.csv", stringsAsFactors = F)
+Test <- read.csv("Data/test.csv", stringsAsFactors = F)
+```
+
+## Analysis
+
+Looking at the cabins and tickets below a few comments can be made.  Firstly, very few passengers seem to have their cabins recorded.  That might be meaniful because only the more meaningful passengers had their cabins recorded, although it might not be.  
+
+The tickets seem to have a pattern.  They all have a number, most of which seem to start with 1, 2 or 3.  Before that some of the tickets seem to have some type of class identifier.  So it is worth investigating the ticket class identifier and the first digit of the tickets.
+
+```{r DataExploration1}
+print(head(Train[, c("Survived", "Name", "Cabin", "Ticket")], n = 30))
+```
+
+## Feature Extraction and Preparation
+
+I used similar feature extraction to the R tutorial.  I also added extra features for the Ticket Prefix and the first letter of the ticket number.
+
+```{r DataPrepartion}
+Test$Survived <- NA
+Full <- rbind(Train, Test)
+
+Full$TicketPrefix <- rep("None", nrow(Full))
+Full$TicketPrefix[grep(" ", Full$Ticket)] <- str_split_fixed(Full$Ticket[grep(" ", Full$Ticket)], " ", 2)[, 1]
+Full$TicketPrefix <- as.factor(toupper(gsub(".", "", gsub("/", "", Full$TicketPrefix, fixed = T), fixed = T)))
+Full$TicketNumberFirstDigit <- substr(Full$Ticket, 1, 1)
+Full$TicketNumberFirstDigit[grep(" ", Full$Ticket)] <- substr(str_split_fixed(Full$Ticket[grep(" ", Full$Ticket)], " ", 2)[, 2], 1, 1)
+Full$Cabin[grep(" ", Full$Cabin)] <- str_split_fixed(Full$Cabin[grep(" ", Full$Cabin)], " ", 2)[, 1]
+Full$CabinRecorded <- str_length(Full$Cabin) > 1
+Full$CabinPrefix <- as.factor(substr(Full$Cabin, 1, 1))
+Full$CabinNumber <- as.integer(substr(Full$Cabin, 2, 1000))
+Full$Title <- sapply(Full$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][2]})
+Full$Title[Full$Title %in% c('Mme', 'Mlle')] <- 'Mlle'
+Full$Title[Full$Title %in% c('Capt', 'Don', 'Major', 'Sir')] <- 'Sir'
+Full$Title[Full$Title %in% c('Dona', 'Lady', 'the Countess', 'Jonkheer')] <- 'Lady'
+Full$Title <- factor(Full$Title)
+Full$FamilySize <- Full$SibSp + Full$Parch + 1
+Full$Surname <- sapply(Full$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][1]})
+Full$FamilyId <- paste(as.character(Full$FamilySize), Full$Surname, sep="")
+Full$FamilyId[Full$FamilySize < 2] <- 'Small'
+FamIDs <- data.frame(table(Full$FamilyId))
+FamIDs <- FamIDs[FamIDs$Freq <= 2,]
+Full$FamilyId[Full$FamilyId %in% FamIDs$Var1] <- 'Small'
+Full$FamilyId <- factor(Full$FamilyId)
+SurvivorShip <- Full %>% filter(!is.na(Survived)) %>% group_by(FamilyId) %>% summarise(Survived = mean(Survived))
+Full$FamilySurvival <- rep(NA, nrow(Full))
+Full$FamilySurvival[Full$FamilyId != "Small"] <- 
+  Full %>% 
+  filter(FamilyId != "Small") %>% 
+  left_join(SurvivorShip, by = "FamilyId") %>% 
+  .$Survived.y
+Full$Sex <- as.factor(Full$Sex)
+Full$Embarked <- as.factor(Full$Embarked)
+
+Train <- Full[!is.na(Full$Survived), ]
+Test <- Full[is.na(Full$Survived), ]
+```
+
+```{r SomeDEGraphs1}
+print(
+  Train %>% 
+    group_by(TicketPrefix) %>% 
+    summarise(Survived = mean(Survived)) %>% 
+    ggplot(aes(x = TicketPrefix, y = Survived)) + 
+    geom_bar(stat = "identity") +
+    coord_flip()
+)
+
+print(
+  Train %>% 
+    group_by(TicketNumberFirstDigit) %>% 
+    summarise(Survived = mean(Survived)) %>% 
+    ggplot(aes(x = factor(TicketNumberFirstDigit), y = Survived)) + 
+    geom_bar(stat = "identity") +
+    coord_flip()
+)
+
+print(
+  Train %>% 
+    group_by(CabinPrefix) %>% 
+    summarise(Survived = mean(Survived)) %>% 
+    ggplot(aes(x = CabinPrefix, y = Survived)) + 
+    geom_bar(stat = "identity") +
+    coord_flip()
+)
+```
+
+There seems to be some mid-lettered effect on survivorship according to the above chart.  But it is hard to rule out that it is anything more than a statistical fact.  But anyway, I am creating a random forest model to assess how likely certain cabins were to survive.  This makes some sense.  Even though I don't know the layout of the ship, and how close each cabin was to an exit, random forest is the best model to find these sort of relationships.  It is based on decision trees, so for instance  could find such relationships as "on level D passengers with cabins number 95 - 110 were more likely to survive".
+
+```{r CreateCabinModel}
+CreateCluster(4)
+CabinModel <- train(as.factor(Survived) ~ CabinPrefix + CabinNumber, data = Train[Train$CabinRecorded, ], model = "rf", tuneLength = 5, trControl = trainControl(method = "cv", savePredictions = T))
+ggplot(CabinModel)
+Train$CabinPrediction <- rep(NA, nrow(Train))
+Train$CabinPrediction[Train$CabinRecorded] <- GetOutOfSamplePredictions(CabinModel)
+Test$CabinPrediction <- rep(NA, nrow(Test))
+Test$CabinPrediction[Test$CabinRecorded] <- predict(CabinModel, Test[Test$CabinRecorded, ])
+```
+
+```{r SetupTraining}
+Features <- c("Pclass", "Sex", "Age", "SibSp", "Parch", "Fare", "Embarked", "TicketPrefix", "TicketNumberFirstDigit", "CabinRecorded", "Title", "FamilySize", "CabinPrediction", "FamilySurvival")
+```
+
+## Pre Processing
+
+I used caret to center and scale all of the features to a mean of 0 and std dev of 1.  I also used knn to impute the missing values.
+
+```{r CreatePreProcessor}
+PreProc <- preProcess(Train[, Features], method = c("center", "scale", "knnImpute"))
+PPTrain <- predict(PreProc, Train[, Features])
+PPTest <- predict(PreProc, Test[, Features])
+```
+
+I used a ensemble (stack) of 5 different models, an SVM, a random forest, a principal component model, knn and glmnet (an regularised regression) 
+
+```{r CreateModels}
+Formula <- as.formula(paste0("Survived ~ ", paste(Features, collapse = " + ")))
+
+Models <- caretList(Formula, data = cbind(Survived = Train$Survived, PPTrain), tuneLength = 5, family = "binomial",
+                    trControl = trainControl(method = "cv", savePredictions = "final"),
+                    methodList = c("glmnet", "pcr", "rf", "knn", "svmRadialCost"))
+
+for (ModelName in names(Models)) { 
+    print(ggplot(Models[[ModelName]]) + ggtitle(ModelName))
+}
+
+Importance <- importance(Models$rf$finalModel)
+Importance <- data.frame(Feature = rownames(Importance), Importance) %>% arrange(IncNodePurity)
+
+EnsembleModel <- caretStack(Models, method = "glmnet", lower.limits = rep(0, length(names(Models))), tuneGrid = data.frame(lambda = 0, alpha = 0))
+
+Coefs <- coef(EnsembleModel$ens_model$finalModel, s = 0)
+print(
+  data.frame(Feature = rownames(Coefs), Weight = Coefs[, 1]) %>% 
+    ggplot(aes(x = Feature, y = Weight)) + 
+    geom_bar(stat = "identity") + 
+    coord_flip()
+)
+```
+
+```{r CreateSubmission}
+Submission <- cbind(PassengerId = Test$PassengerId, Survived = predict(EnsembleModel, PPTest[, Features]) > 0.55)
+write.csv(Submission, "Submission.csv", row.names = F)
+```
