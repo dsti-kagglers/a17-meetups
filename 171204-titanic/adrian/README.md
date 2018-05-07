@@ -1,1 +1,1 @@
-The focus was more on demonstrating the use of [scikit-learn pipelines](http://scikit-learn.org/stable/modules/pipeline.html) and creation of various imputers, extractors, and transformers, rather than on the solution to the challenge.
+The focus was more on demonstrating the use of [scikit-learn pipelines](http://scikit-learn.org/stable/modules/pipeline.html) and the creation of various imputers, extractors, and transformers, rather than on the solution to the challenge.
